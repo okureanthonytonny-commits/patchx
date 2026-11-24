@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+import argparse, json, os, re, subprocess, sys, time
+
+TRANSIENT = ("connection refused", "timeout", "timed out",
+             "temporary failure", "unable to access")
+REQ = {"replace": ("file", "old", "new"),
+       "append": ("file", "text"),
+       "create": ("file", "text")}
+
+HELP = {}
+HELP["main"] = """patchx - apply file edits idempotently, then commit and push.
+
+usage:
+  patchx replace FILE OLD NEW [flags]
+  patchx append  FILE TEXT    [flags]
+  patchx create  FILE TEXT    [flags]
+  patchx --json '<json>'      [flags]
+  patchx --file ops.json      [flags]
+
+flags:
+  -m, --message MSG   commit message (required unless the json has "message")
+  --json JSON         ops as a json string
+  --file PATH         ops as a json file
+  --regex             OLD is a regex (replace, shell form only)
+  --repo DIR          repo root (default: current directory)
+  --dry-run           print the plan, write nothing
+  --no-push           commit but do not push
+  -h, --help [TOPIC]  this text, or one topic: schema ops states examples
+
+exit: 0 = WRITTEN or SKIPPED, 1 = ABORT
+"""
+HELP["schema"] = """json schema:
+
+{
+  "message": "commit message",
+  "ops": [
+    {"op": "replace", "file": "README.md", "old": "text", "new": "text", "regex": false},
+    {"op": "append",  "file": "notes.txt", "text": "line"},
+    {"op": "create",  "file": "a/b.txt",   "text": "content"}
+  ]
+}
+
+also accepted: a bare list of ops, or a single op object.
+"message" in json is overridden by -m.
+required per op: replace = file, old, new / append, create = file, text.
+"regex" is optional on replace (default false).
+file paths are relative to --repo.
+"""
+HELP["ops"] = """ops:
+
+replace  old must match exactly once in the file (literal, or regex with
+         regex=true / --regex); that one match becomes new.
+append   text is added to the end of the file on its own line; the file
+         is created if missing.
+create   writes text to a new file; ABORT if the file exists with
+         different content.
+
+several ops in one run are validated in order against the file as the
+earlier ops would leave it; any ABORT stops the whole run, nothing is
+written or committed.
+"""
+HELP["states"] = """per-op states:
+
+SKIPPED      change already present in HEAD
+COMMIT_ONLY  change already on disk but not in HEAD (resume after a
+             failed commit)
+WRITE        change will be written
+ABORT        cannot apply (no match, several matches, file missing,
+             bad input)
+
+run result:
+WRITTEN (<hash>: <message>)   a commit was made
+SKIPPED                       nothing to commit
+ABORT: <reason>               nothing written
+"""
+HELP["examples"] = """examples:
+
+patchx replace README.md 'old line' 'new line' -m 'docs: reword line'
+patchx replace conf.sh 'N=[0-9]+' 'N=8' --regex -m 'conf: N to 8'
+patchx append .gitignore '.patches/' -m 'gitignore: add .patches'
+patchx create docs/new.md 'hello' -m 'docs: add new.md'
+patchx --json '{"message":"m","ops":[{"op":"append","file":"a","text":"x"}]}'
+patchx --file ops.json --dry-run
+"""
+
+
+def git(repo, *a):
+    return subprocess.run(["git", "-C", repo] + list(a),
+                          capture_output=True, text=True)
+
+
+def head_text(repo, rel):
+    r = git(repo, "show", "HEAD:" + rel)
+    return r.stdout if r.returncode == 0 else None
+
+
+def read(path):
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return f.read()
+
+
+def load_ops(a):
+    if a.json:
+        data = json.loads(a.json)
+    elif a.file:
+        with open(a.file) as f:
+            data = json.load(f)
+    elif a.words:
+        kind, w = a.words[0], a.words[1:]
+        if kind not in REQ or len(w) != len(REQ[kind]):
+            raise ValueError("bad shell form, see: patchx --help examples")
+        if kind == "replace":
+            data = {"op": kind, "file": w[0], "old": w[1], "new": w[2],
+                    "regex": a.regex}
+        else:
+            data = {"op": kind, "file": w[0], "text": w[1]}
+    else:
+        raise ValueError("no input, see: patchx --help")
+    msg = None
+    if isinstance(data, dict) and "ops" in data:
+        msg, ops = data.get("message"), data["ops"]
+    elif isinstance(data, dict):
+        msg, ops = data.get("message"), [data]
+    elif isinstance(data, list):
+        ops = data
+    else:
+        raise ValueError("json must be an object or a list")
+    if not isinstance(ops, list) or not ops:
+        raise ValueError("no ops given")
+    for i, op in enumerate(ops, 1):
+        kind = op.get("op") if isinstance(op, dict) else None
+        if kind not in REQ:
+            raise ValueError("op %d: unknown or missing op" % i)
+        for k in REQ[kind]:
+            if not isinstance(op.get(k), str):
+                raise ValueError("op %d (%s): missing string field '%s'"
+                                 % (i, kind, k))
+    return ops, (a.message or msg)
+
+
+def plan_op(op, repo, overlay):
+    rel = op["file"]
+    path = os.path.join(repo, rel)
+    cur = overlay[rel] if rel in overlay else read(path)
+    head = head_text(repo, rel)
+    kind = op["op"]
+
+    if kind == "replace":
+        if cur is None:
+            return "ABORT", None, "file not found"
+        old, new = op["old"], op["new"]
+        rx = bool(op.get("regex"))
+        if rx:
+            try:
+                re.compile(old)
+            except re.error as e:
+                return "ABORT", None, "bad regex: %s" % e
+
+        def found(text):
+            return bool(re.search(old, text, re.M)) if rx else old in text
+
+        def applied(text):
+            return (new in text) if new else (not found(text))
+
+        if head is not None and applied(head):
+            return "SKIPPED", None, ""
+        if applied(cur):
+            return "COMMIT_ONLY", None, ""
+        n = len(re.findall(old, cur, re.M)) if rx else cur.count(old)
+        if n != 1:
+            return "ABORT", None, "old matched %d times, need exactly 1" % n
+        if rx:
+            out = re.sub(old, new, cur, count=1, flags=re.M)
+        else:
+            out = cur.replace(old, new, 1)
+        return "WRITE", out, ""
+
+    if kind == "append":
+        t = op["text"].rstrip("\n")
+        if head is not None and t in head:
+            return "SKIPPED", None, ""
+        if cur is not None and t in cur:
+            return "COMMIT_ONLY", None, ""
+        base = cur or ""
+        sep = "" if (not base or base.endswith("\n")) else "\n"
+        return "WRITE", base + sep + t + "\n", ""
+
+    t = op["text"]
+    if cur is None:
+        return "WRITE", t, ""
+    if cur != t:
+        return "ABORT", None, "file exists with different content"
+    return ("SKIPPED" if head == t else "COMMIT_ONLY"), None, ""
+
+
+def push_with_retry(repo):
+    start, delay = time.time(), 2
+    while True:
+        r = git(repo, "push")
+        if r.returncode == 0:
+            return True
+        err = (r.stderr + r.stdout).strip()
+        elapsed = int(time.time() - start)
+        if (not any(t in err.lower() for t in TRANSIENT)
+                or elapsed + delay > 180):
+            print("ABORT: push failed: " + err)
+            return False
+        print("push retry in %ds (elapsed %ds)" % (delay, elapsed))
+        time.sleep(delay)
+        delay = min(delay * 2, 30)
+
+
+def run(a):
+    repo = os.path.abspath(a.repo)
+    if git(repo, "rev-parse", "--is-inside-work-tree").returncode != 0:
+        print("ABORT: not a git repo: " + repo)
+        return 1
+    try:
+        ops, msg = load_ops(a)
+    except (ValueError, OSError, json.JSONDecodeError) as e:
+        print("ABORT: " + str(e))
+        return 1
+    if not msg:
+        print("ABORT: commit message required (-m or json 'message')")
+        return 1
+
+    overlay, plans, failed = {}, [], False
+    for i, op in enumerate(ops, 1):
+        state, out, why = plan_op(op, repo, overlay)
+        if state == "WRITE":
+            overlay[op["file"]] = out
+        plans.append((op, state))
+        line = "  [%d] %-11s %s %s" % (i, state, op["op"], op["file"])
+        print(line + ("  (%s)" % why if why else ""))
+        failed = failed or state == "ABORT"
+    if failed:
+        print("ABORT: nothing written")
+        return 1
+    if a.dry_run:
+        print("DRY RUN: nothing written")
+        return 0
+
+    for rel, content in overlay.items():
+        path = os.path.join(repo, rel)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+    touched = sorted({op["file"] for op, s in plans
+                      if s in ("WRITE", "COMMIT_ONLY")})
+    committed = False
+    if touched:
+        git(repo, "add", "--", *touched)
+        if git(repo, "diff", "--cached", "--quiet").returncode != 0:
+            r = git(repo, "commit", "-m", msg)
+            if r.returncode != 0:
+                print("ABORT: commit failed: " + r.stderr.strip())
+                return 1
+            committed = True
+    if not a.no_push and not push_with_retry(repo):
+        return 1
+    if committed:
+        h = git(repo, "log", "-1", "--format=%h: %s").stdout.strip()
+        print("WRITTEN (%s)" % h)
+    else:
+        print("SKIPPED")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("-h", "--help", nargs="?", const="main")
+    p.add_argument("-m", "--message")
+    p.add_argument("--json")
+    p.add_argument("--file")
+    p.add_argument("--regex", action="store_true")
+    p.add_argument("--repo", default=".")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-push", action="store_true")
+    p.add_argument("words", nargs="*")
+    a = p.parse_args()
+    if a.help is not None or len(sys.argv) == 1:
+        topic = a.help or "main"
+        if topic not in HELP:
+            print("unknown help topic '%s' (schema ops states examples)"
+                  % topic)
+            return 1
+        print(HELP[topic])
+        return 0
+    return run(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
