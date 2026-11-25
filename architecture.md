@@ -71,9 +71,15 @@ overlay only after all ops pass.
 
 ## Commit and push
 
-- Files with state `WRITE` or `COMMIT_ONLY` are staged with `git add`.
-- A commit is made only if something is actually staged; otherwise the
-  run result is `SKIPPED`.
+- Files with state `WRITE` or `COMMIT_ONLY` are staged with `git add`;
+  a failed add is an `ABORT`.
+- The commit is scoped to those files (`git commit -- FILES`), so other
+  staged files are left alone. It is made only if those files have
+  staged changes.
+- Push runs only if a commit was made or earlier local commits are
+  unpushed. A push failure after a commit reports `WRITTEN locally ...
+  NOT pushed` (exit 1); re-running resumes with `PUSHED (<n> earlier
+  commit(s))`.
 - Push retries on transient network errors (connection refused,
   timeout, temporary failure, unable to access) with exponential
   backoff: 2s base, 30s cap, 180s total. Each retry prints elapsed
@@ -90,11 +96,16 @@ file.
 
 ## Exit codes
 
-0 for `WRITTEN` and `SKIPPED`, 1 for any `ABORT`.
+0 for `WRITTEN`, `PUSHED` and `SKIPPED`; 1 for any `ABORT` or a failed
+push.
 
 ## Conventions
 
 - The tool never deletes its own input; a `--file` json stays where it is.
-- Paths in ops are relative to the repo root given by `--repo`
-  (default: current directory).
+- The repo root is resolved with `git rev-parse --show-toplevel` from
+  `--repo` (default: current directory); paths in ops are relative to
+  that root, so patchx works from any subdirectory.
+- A path that `git check-ignore` reports as ignored is an `ABORT` at
+  plan time, before anything is written.
+- File and git I/O is UTF-8 regardless of locale.
 - Code comments describe what code does; reasoning lives in these docs.

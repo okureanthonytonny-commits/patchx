@@ -22,12 +22,12 @@ flags:
   --json JSON         ops as a json string
   --file PATH         ops as a json file
   --regex             OLD is a regex (replace, shell form only)
-  --repo DIR          repo root (default: current directory)
+  --repo DIR          a directory inside the repo (default: current directory)
   --dry-run           print the plan, write nothing
   --no-push           commit but do not push
   -h, --help [TOPIC]  this text, or one topic: schema ops states examples
 
-exit: 0 = WRITTEN or SKIPPED, 1 = ABORT
+exit: 0 = WRITTEN, PUSHED or SKIPPED, 1 = ABORT or failed push
 """
 HELP["schema"] = """json schema:
 
@@ -44,7 +44,7 @@ also accepted: a bare list of ops, or a single op object.
 "message" in json is overridden by -m.
 required per op: replace = file, old, new / append, create = file, text.
 "regex" is optional on replace (default false).
-file paths are relative to --repo.
+file paths are relative to the repo root.
 """
 HELP["ops"] = """ops:
 
@@ -69,8 +69,12 @@ ABORT        cannot apply (no match, several matches, file missing,
              bad input)
 
 run result:
-WRITTEN (<hash>: <message>)   a commit was made
-SKIPPED                       nothing to commit
+WRITTEN (<hash>: <message>)   a commit was made and pushed
+WRITTEN locally (...) but NOT pushed   commit made, push failed (exit 1);
+                              re-run the same command to push it
+PUSHED (<n> earlier commit(s))   nothing new to commit, earlier local
+                              commits were pushed
+SKIPPED                       nothing to do
 ABORT: <reason>               nothing written
 """
 HELP["examples"] = """examples:
@@ -86,7 +90,8 @@ patchx --file ops.json --dry-run
 
 def git(repo, *a):
     return subprocess.run(["git", "-C", repo] + list(a),
-                          capture_output=True, text=True)
+                          capture_output=True, encoding="utf-8",
+                          errors="replace")
 
 
 def head_text(repo, rel):
@@ -97,7 +102,7 @@ def head_text(repo, rel):
 def read(path):
     if not os.path.isfile(path):
         return None
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return f.read()
 
 
@@ -105,7 +110,7 @@ def load_ops(a):
     if a.json:
         data = json.loads(a.json)
     elif a.file:
-        with open(a.file) as f:
+        with open(a.file, encoding="utf-8") as f:
             data = json.load(f)
     elif a.words:
         kind, w = a.words[0], a.words[1:]
@@ -143,6 +148,8 @@ def load_ops(a):
 def plan_op(op, repo, overlay):
     rel = op["file"]
     path = os.path.join(repo, rel)
+    if git(repo, "check-ignore", "-q", "--", rel).returncode == 0:
+        return "ABORT", None, "path is gitignored"
     cur = overlay[rel] if rel in overlay else read(path)
     head = head_text(repo, rel)
     kind = op["op"]
@@ -205,7 +212,7 @@ def push_with_retry(repo):
         elapsed = int(time.time() - start)
         if (not any(t in err.lower() for t in TRANSIENT)
                 or elapsed + delay > 180):
-            print("ABORT: push failed: " + err)
+            print("push failed: " + err)
             return False
         print("push retry in %ds (elapsed %ds)" % (delay, elapsed))
         time.sleep(delay)
@@ -213,10 +220,12 @@ def push_with_retry(repo):
 
 
 def run(a):
-    repo = os.path.abspath(a.repo)
-    if git(repo, "rev-parse", "--is-inside-work-tree").returncode != 0:
-        print("ABORT: not a git repo: " + repo)
+    start_dir = os.path.abspath(a.repo)
+    top = git(start_dir, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        print("ABORT: not a git repo: " + start_dir)
         return 1
+    repo = top.stdout.strip()
     try:
         ops, msg = load_ops(a)
     except (ValueError, OSError, json.JSONDecodeError) as e:
@@ -245,24 +254,42 @@ def run(a):
     for rel, content in overlay.items():
         path = os.path.join(repo, rel)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(content)
     touched = sorted({op["file"] for op, s in plans
                       if s in ("WRITE", "COMMIT_ONLY")})
     committed = False
     if touched:
-        git(repo, "add", "--", *touched)
-        if git(repo, "diff", "--cached", "--quiet").returncode != 0:
-            r = git(repo, "commit", "-m", msg)
+        r = git(repo, "add", "--", *touched)
+        if r.returncode != 0:
+            print("ABORT: git add failed: " + r.stderr.strip())
+            return 1
+        if git(repo, "diff", "--cached", "--quiet", "--",
+               *touched).returncode != 0:
+            r = git(repo, "commit", "-m", msg, "--", *touched)
             if r.returncode != 0:
                 print("ABORT: commit failed: " + r.stderr.strip())
                 return 1
             committed = True
-    if not a.no_push and not push_with_retry(repo):
-        return 1
+    summary = ""
     if committed:
-        h = git(repo, "log", "-1", "--format=%h: %s").stdout.strip()
-        print("WRITTEN (%s)" % h)
+        summary = git(repo, "log", "-1", "--format=%h: %s").stdout.strip()
+    ahead = 0
+    if not a.no_push:
+        r = git(repo, "rev-list", "--count", "@{u}..HEAD")
+        ahead = int(r.stdout) if r.returncode == 0 else 0
+        if (committed or ahead) and not push_with_retry(repo):
+            if committed:
+                print("WRITTEN locally (%s) but NOT pushed; re-run to resume"
+                      % summary)
+            else:
+                print("NOT pushed: %d earlier local commit(s) remain; "
+                      "re-run to resume" % ahead)
+            return 1
+    if committed:
+        print("WRITTEN (%s)" % summary)
+    elif ahead:
+        print("PUSHED (%d earlier commit(s))" % ahead)
     else:
         print("SKIPPED")
     return 0

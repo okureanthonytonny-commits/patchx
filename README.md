@@ -24,7 +24,8 @@ patchx --help
 
 ## Usage
 
-Run from the root of the repo being patched, or pass `--repo DIR`.
+Run from anywhere inside the repo being patched, or pass `--repo DIR`.
+File paths are relative to the repo root.
 
 ~~~
 patchx replace FILE OLD NEW -m MSG [--regex]
@@ -40,7 +41,7 @@ patchx --file ops.json
 | `--json JSON` | ops as a json string |
 | `--file PATH` | ops as a json file |
 | `--regex` | OLD is a regex (replace, shell form only) |
-| `--repo DIR` | repo root (default: current directory) |
+| `--repo DIR` | a directory inside the repo (default: current directory) |
 | `--dry-run` | print the plan, write nothing |
 | `--no-push` | commit but do not push |
 | `-h, --help [TOPIC]` | help; topics: `schema` `ops` `states` `examples` |
@@ -79,8 +80,13 @@ are relative to the repo root.
 
 Per op: `SKIPPED` (already in HEAD), `COMMIT_ONLY` (on disk, not in
 HEAD), `WRITE`, `ABORT`. Per run: `WRITTEN (<hash>: <message>)`,
-`SKIPPED`, or `ABORT: <reason>`. Exit 0 for the first two, 1 for ABORT.
-Re-running the same patch is safe.
+`WRITTEN locally (...) but NOT pushed` (commit made, push failed),
+`PUSHED (<n> earlier commit(s))`, `SKIPPED`, or `ABORT: <reason>`.
+Exit 0 for WRITTEN, PUSHED and SKIPPED; 1 for ABORT or a failed push.
+Re-running the same patch is safe, and resumes a failed push.
+
+A commit contains only the files the run touched; other staged files
+stay staged. A path ignored by `.gitignore` is an ABORT.
 
 Push retries with backoff (2s base, 30s cap, 180s total) on transient
 network errors only; auth/rejected errors fail immediately.
@@ -90,11 +96,21 @@ network errors only; auth/rejected errors fail immediately.
 - Draft. Exercised in a scratch repo only, not yet on a real project.
 - "Already applied" is a substring check: if `new` (or the appended
   text) already appears anywhere in the file, the op counts as applied.
-- `--repo` must be the repo root; file paths are root-relative.
+- Line endings are normalized to `\n` on write (CRLF files lose the `\r`).
 - Pushes to the current branch's upstream; no remote/branch options.
 - A shell-form argument starting with `-` is read as a flag; use json.
 - No txt-file input, no anchor-bounded replace, no progress-log hash
   check yet. See `ideas.md`.
+
+## Tests
+
+~~~
+python3 tests/test_patchx.py
+~~~
+
+Scratch repos and a local bare remote live under `tests/.scratch/`
+(removed after each test); no network needed. `PATCHX_BIN=path` tests
+another copy of the script.
 
 ## Docs
 
